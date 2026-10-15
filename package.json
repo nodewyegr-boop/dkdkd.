@@ -1,0 +1,15 @@
+{
+  "name": "valan-shop",
+  "version": "1.0.0",
+  "description": "รับซอง TrueMoney Gift ผ่านเว็บ + API สำหรับบอทดิสคอร์ด",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
